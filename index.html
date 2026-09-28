@@ -1,0 +1,566 @@
+# -*- coding: utf-8 -*-
+"""
+Gera o Gantt historico do processo licitatorio.
+
+Le o CSV produzido por analises_transversais.py:
+  analise/1_linha_do_tempo.csv
+
+Melhorias implementadas:
+  1. Subtitulo com metadados (data de processamento, total de eventos, cobertura).
+  2. Faixa sombreada destacando o periodo de Silencio Documental ate a data de referencia.
+  3. Linhas zebradas alternadas no fundo (Banded Rows) para rastreamento visual horizontal.
+  5. Filtros interativos no HTML via menu suspenso (Todos os Niveis, Apenas Atencao + Critico, Apenas Critico).
+
+Uso:
+  py gerar_gantt.py
+  py gerar_gantt.py --cor categoria
+  py gerar_gantt.py --cor criticidade
+"""
+
+import os
+import csv
+import argparse
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from collections import defaultdict
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
+    from matplotlib.patches import Patch
+except ImportError:
+    print("Instale: py -m pip install matplotlib")
+    raise
+
+HAS_PLOTLY = False
+try:
+    import plotly.graph_objects as go
+    HAS_PLOTLY = True
+except ImportError:
+    print("[AVISO] plotly nao instalado. Instale com: py -m pip install plotly")
+
+
+# ============================================================
+# CONFIGURACAO
+# ============================================================
+
+BASE_DIR = r"C:\ESTACAO_IA\trabalho\01Entrada\Converte_tudo_em_TXT"
+ANALISE_DIR = os.path.join(BASE_DIR, "analise")
+CSV_IN = os.path.join(ANALISE_DIR, "1_linha_do_tempo.csv")
+
+DATA_HOJE = date(2026, 9, 28)
+NUM_PROCESSO_SEI = "23112.001583/2025-91"
+SCRIPT_GERADOR = Path(__file__).name if "__file__" in globals() else "gerar_gantt.py"
+
+CORES_CATEGORIAS = {
+    "ADMINISTRACAO INTERNA":                "#1f77b4",
+    "COMUNICACAO EXTERNA":                  "#2ca02c",
+    "HABILITACAO DOS LICITANTES":           "#9467bd",
+    "JURIDICO E PARECERES":                 "#d62728",
+    "ORCAMENTO E FINANCEIRO":               "#ff7f0e",
+    "PLANEJAMENTO E ESCOPO":                "#17becf",
+    "PROPOSTAS COMERCIAIS DOS LICITANTES":  "#8c564b",
+    "DESCONHECIDA":                         "#7f7f7f",
+}
+
+CORES_CRITICIDADE = {
+    "normal":       "#2ca02c",
+    "atencao":      "#ffbf00",
+    "critico":      "#d62728",
+    "desconhecida": "#7f7f7f",
+}
+
+
+# ============================================================
+# CARREGAMENTO DE DADOS
+# ============================================================
+
+def carregar_eventos():
+    if not os.path.exists(CSV_IN):
+        print(f"ERRO: CSV nao encontrado: {CSV_IN}")
+        print("Rode primeiro 'py analises_transversais.py'.")
+        return []
+
+    eventos = []
+    with open(CSV_IN, "r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        for i, row in enumerate(reader):
+            d_str = (row.get("data") or "").strip()
+            if not d_str:
+                continue
+            try:
+                d = date.fromisoformat(d_str)
+            except ValueError:
+                continue
+
+            df_str = (row.get("data_fim") or "").strip()
+            df = None
+            if df_str:
+                try:
+                    df = date.fromisoformat(df_str)
+                except ValueError:
+                    df = None
+
+            cat = (row.get("categoria") or "DESCONHECIDA").strip()
+            crit = (row.get("criticidade") or "desconhecida").strip().lower()
+
+            eventos.append({
+                "id": i,
+                "data": d,
+                "data_fim": df,
+                "categoria": cat,
+                "evento": (row.get("evento") or "")[:60],
+                "tipo_documento": row.get("tipo_documento", ""),
+                "parte": row.get("parte_originadora", ""),
+                "criticidade": crit,
+                "doc_fonte": row.get("doc_fonte", ""),
+                "descricao": row.get("descricao", ""),
+            })
+
+    return eventos
+
+
+def obter_marcas_temporais(d_min, d_max):
+    ano_inicio = d_min.year
+    ano_fim = max(d_max.year, DATA_HOJE.year) + 1
+    viradas_ano = []
+    semestres = []
+
+    for y in range(ano_inicio, ano_fim + 1):
+        d_ano = date(y, 1, 1)
+        if d_min <= d_ano <= d_max or d_min <= d_ano <= DATA_HOJE:
+            viradas_ano.append(d_ano)
+        d_sem = date(y, 7, 1)
+        if d_min <= d_sem <= d_max or d_min <= d_sem <= DATA_HOJE:
+            semestres.append(d_sem)
+
+    return viradas_ano, semestres
+
+
+# ============================================================
+# MATPLOTLIB (PNG)
+# ============================================================
+
+def gera_png(eventos, caminho_saida, timestamp_dt, modo_cor="categoria"):
+    if not eventos:
+        print("Sem eventos para plotar.")
+        return
+
+    eventos_ord = sorted(eventos, key=lambda e: e["data"])
+
+    d_min = min(e["data"] for e in eventos_ord)
+    d_max = max(e["data"] for e in eventos_ord)
+    d_hoje = DATA_HOJE
+
+    margem = timedelta(days=15)
+    x_min = d_min - margem
+    x_max = max(d_max, d_hoje) + margem
+
+    fig, ax = plt.subplots(figsize=(18, max(8, len(eventos_ord) * 0.22)))
+
+    for i in range(len(eventos_ord)):
+        y = len(eventos_ord) - i
+        if i % 2 == 1:
+            ax.axhspan(y - 0.5, y + 0.5, color="#f7f9fa", zorder=0)
+
+    if d_max < d_hoje:
+        ax.axvspan(
+            mdates.date2num(d_max),
+            mdates.date2num(d_hoje),
+            color="#e0e0e0",
+            alpha=0.45,
+            zorder=1,
+            label="Silêncio documental"
+        )
+        meio_silencio = d_max + (d_hoje - d_max) / 2
+        ax.text(
+            mdates.date2num(meio_silencio),
+            len(eventos_ord) * 0.5,
+            f"Silêncio Documental: {(d_hoje - d_max).days} dias",
+            rotation=90,
+            ha="center",
+            va="center",
+            fontsize=8,
+            color="#666666",
+            style="italic",
+            zorder=2
+        )
+
+    viradas_ano, semestres = obter_marcas_temporais(d_min, max(d_max, d_hoje))
+
+    for d_sem in semestres:
+        ax.axvline(mdates.date2num(d_sem), color="#aaaaaa", linestyle=":", linewidth=0.8, alpha=0.7, zorder=2)
+
+    for d_ano in viradas_ano:
+        ax.axvline(mdates.date2num(d_ano), color="#333333", linestyle="-", linewidth=1.8, alpha=0.8, zorder=3)
+
+    for i, e in enumerate(eventos_ord):
+        inicio = e["data"]
+        fim = e["data_fim"] if e["data_fim"] and e["data_fim"] >= inicio else inicio + timedelta(days=1)
+
+        cor = CORES_CATEGORIAS.get(e["categoria"], "#7f7f7f") if modo_cor == "categoria" else CORES_CRITICIDADE.get(e["criticidade"], "#7f7f7f")
+
+        y = len(eventos_ord) - i
+        ax.barh(
+            y,
+            (fim - inicio).days + 1,
+            left=mdates.date2num(inicio),
+            height=0.7,
+            color=cor,
+            edgecolor="black" if e["criticidade"] == "critico" else "none",
+            linewidth=1.5 if e["criticidade"] == "critico" else 0,
+            zorder=4
+        )
+
+    ax.set_yticks([len(eventos_ord) - i for i in range(len(eventos_ord))])
+    ax.set_yticklabels(
+        [f"{e['data'].strftime('%d/%m/%y')}  {e['evento'][:55]}" for e in eventos_ord],
+        fontsize=8.5,
+    )
+    plt.setp(ax.get_yticklabels(), ha="left", position=(-0.48, 0))
+
+    ax.axvline(mdates.date2num(d_hoje), color="black", linestyle="--", linewidth=1.5, alpha=0.8, zorder=5)
+    ax.text(mdates.date2num(d_hoje), len(eventos_ord) + 1, f"Hoje: {d_hoje.strftime('%d/%m/%Y')}",
+            fontsize=8, ha="center", va="bottom")
+
+    ax.set_xlim(mdates.date2num(x_min), mdates.date2num(x_max))
+    ax.xaxis.set_major_locator(mdates.MonthLocator(interval=1))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%m/%Y"))
+    plt.setp(ax.get_xticklabels(), rotation=45, ha="right", fontsize=8)
+
+    ax.set_ylim(0, len(eventos_ord) + 2)
+    ax.set_xlabel("Data")
+
+    data_proc_str = timestamp_dt.strftime("%d/%m/%Y %H:%M:%S")
+    cobertura_dias = (d_max - d_min).days
+
+    titulo = "Construção do prédio do DAC - Linha do tempo do processo SEI"
+    linha_2 = (
+        f"Diagrama gerado para a Comissão de Espaço Físico e Infraestrutura do DAC por Roberto Eiti. "
+        f"Informações extraídas do processo SEI {NUM_PROCESSO_SEI}, mas pode conter imprecisões"
+    )
+    linha_script = f"Gerador do diagrama: {SCRIPT_GERADOR}"
+    linha_info = (
+        f"Processado em: {data_proc_str} | Total: {len(eventos_ord)} eventos | "
+        f"Período: {d_min.strftime('%d/%m/%Y')} a {d_max.strftime('%d/%m/%Y')} ({cobertura_dias} dias) | "
+        f"Cor por {modo_cor}"
+    )
+
+    plt.suptitle(titulo, fontsize=14, fontweight="bold", y=0.99)
+    subtitulo_formatado = f"{linha_2}\n{linha_script}\n$\\bf{{{linha_info}}}$"
+    ax.set_title(subtitulo_formatado, fontsize=8, color="#333333", pad=16)
+
+    ax.grid(True, axis="x", alpha=0.2)
+
+    if modo_cor == "categoria":
+        cats_presentes = sorted(set(e["categoria"] for e in eventos_ord))
+        handles = [Patch(facecolor=CORES_CATEGORIAS.get(c, "#7f7f7f"), label=c) for c in cats_presentes]
+    else:
+        handles = [
+            Patch(facecolor=CORES_CRITICIDADE["critico"], label="critico"),
+            Patch(facecolor=CORES_CRITICIDADE["atencao"], label="atencao"),
+            Patch(facecolor=CORES_CRITICIDADE["normal"], label="normal"),
+        ]
+    ax.legend(handles=handles, loc="upper left", bbox_to_anchor=(1.025, 1), fontsize=8, frameon=True)
+
+    plt.tight_layout()
+    plt.savefig(caminho_saida, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  [OK] {caminho_saida}")
+
+
+# ============================================================
+# PLOTLY (HTML)
+# ============================================================
+
+def construir_figura_plotly(lista_ordenada, titulo_complemento, timestamp_dt, modo_cor="categoria"):
+    cor_map = CORES_CATEGORIAS if modo_cor == "categoria" else CORES_CRITICIDADE
+    cor_campo = "categoria" if modo_cor == "categoria" else "criticidade"
+
+    fig = go.Figure()
+
+    vis_todos = []
+    vis_atencao_critico = []
+    vis_apenas_critico = []
+    legenda_adicionada = set()
+
+    margin_l = 490
+    offset_recuo_px = 370
+    x0_bandas = - (offset_recuo_px / margin_l)
+
+    anotacoes_rotulos = []
+
+    for i, e in enumerate(lista_ordenada):
+        inicio = e["data"]
+        fim = e["data_fim"] if e["data_fim"] and e["data_fim"] >= inicio else inicio + timedelta(days=2)
+        duracao_ms = int((fim - inicio).total_seconds() * 1000)
+
+        chave_cor = e[cor_campo]
+        cor = cor_map.get(chave_cor, "#7f7f7f")
+        crit = e["criticidade"]
+
+        vis_todos.append(True)
+        vis_atencao_critico.append(crit in ("atencao", "critico"))
+        vis_apenas_critico.append(crit == "critico")
+
+        exibir_legenda = chave_cor not in legenda_adicionada
+        if exibir_legenda:
+            legenda_adicionada.add(chave_cor)
+
+        fig.add_trace(go.Bar(
+            x=[duracao_ms],
+            y=[i],
+            base=[inicio.strftime("%Y-%m-%d 00:00:00")],
+            orientation="h",
+            marker=dict(
+                color=cor,
+                line=dict(
+                    color="black",
+                    width=2 if crit == "critico" else 0,
+                )
+            ),
+            name=chave_cor,
+            legendgroup=chave_cor,
+            showlegend=exibir_legenda,
+            hovertext=(
+                f"<b>{e['evento']}</b><br>"
+                f"Início: {inicio.strftime('%d/%m/%Y')}<br>"
+                f"Fim: {fim.strftime('%d/%m/%Y')}<br>"
+                f"Categoria: {e['categoria']}<br>"
+                f"Tipo: {e['tipo_documento']}<br>"
+                f"Parte: {e['parte']}<br>"
+                f"Criticidade: {e['criticidade']}<br>"
+                f"Fonte: {e['doc_fonte']}<br>"
+                f"<i>{e['descricao'][:200]}</i>"
+            ),
+            hoverinfo="text",
+        ))
+
+        texto_rotulo = f"{e['id']:03d} | {inicio.strftime('%d/%m/%y')} | {e['evento'][:55]}"
+        anotacoes_rotulos.append(dict(
+            xref="paper",
+            yref="y",
+            x=-0.01,
+            y=i,
+            text=texto_rotulo,
+            showarrow=False,
+            xanchor="right",
+            yanchor="middle",
+            font=dict(family="Courier New, monospace", size=10.5, color="#111111"),
+        ))
+
+    d_min = min(e["data"] for e in lista_ordenada)
+    d_max = max(e["data"] for e in lista_ordenada)
+    viradas_ano, semestres = obter_marcas_temporais(d_min, max(d_max, DATA_HOJE))
+
+    for i in range(len(lista_ordenada)):
+        if i % 2 == 1:
+            fig.add_shape(
+                type="rect",
+                xref="paper",
+                yref="y",
+                x0=x0_bandas,
+                x1=1.0,
+                y0=i - 0.5,
+                y1=i + 0.5,
+                fillcolor="#eef4f8",
+                layer="below",
+                line_width=0,
+            )
+
+    if d_max < DATA_HOJE:
+        fig.add_vrect(
+            x0=d_max.strftime("%Y-%m-%d"),
+            x1=DATA_HOJE.strftime("%Y-%m-%d"),
+            fillcolor="rgba(210, 210, 210, 0.45)",
+            layer="below",
+            line_width=0,
+            annotation_text=f"Silêncio Documental: {(DATA_HOJE - d_max).days} dias",
+            annotation_position="top left",
+            annotation_font=dict(size=10, color="#555555"),
+        )
+
+    for d_sem in semestres:
+        fig.add_vline(
+            x=d_sem.strftime("%Y-%m-%d"),
+            line=dict(color="rgba(150, 150, 150, 0.6)", width=1, dash="dot"),
+            layer="below"
+        )
+
+    for d_ano in viradas_ano:
+        fig.add_vline(
+            x=d_ano.strftime("%Y-%m-%d"),
+            line=dict(color="rgba(40, 40, 40, 0.9)", width=2.5, dash="solid"),
+            layer="below"
+        )
+
+    fig.add_vline(
+        x=DATA_HOJE.strftime("%Y-%m-%d"),
+        line=dict(color="black", width=2, dash="dash"),
+        annotation_text=f"Hoje: {DATA_HOJE.strftime('%d/%m/%Y')}",
+        annotation_position="top right",
+    )
+
+    botoes_filtro = [
+        dict(
+            label="Todos os Eventos",
+            method="update",
+            args=[{"visible": vis_todos}],
+        ),
+        dict(
+            label="Apenas Atenção e Crítico",
+            method="update",
+            args=[{"visible": vis_atencao_critico}],
+        ),
+        dict(
+            label="Apenas Crítico",
+            method="update",
+            args=[{"visible": vis_apenas_critico}],
+        ),
+    ]
+
+    data_proc_str = timestamp_dt.strftime("%d/%m/%Y %H:%M:%S")
+    cobertura_dias = (d_max - d_min).days
+    texto_titulo = (
+        "<span style='font-size:18px;'><b>Construção do prédio do DAC - Linha do tempo do processo SEI</b></span><br>"
+        f"<span style='font-size:11px;color:#444444;'>Diagrama gerado para a Comissão de Espaço Físico e Infraestrutura do DAC por Roberto Eiti. Informações extraídas do processo SEI {NUM_PROCESSO_SEI}, mas pode conter imprecisões</span><br>"
+        f"<span style='font-size:11px;color:#555555;'>Gerador do diagrama: {SCRIPT_GERADOR}</span><br>"
+        f"<span style='font-size:11px;color:#222222;'><b>Processado em: {data_proc_str} | Total: {len(lista_ordenada)} eventos | Período: {d_min.strftime('%d/%m/%Y')} a {d_max.strftime('%d/%m/%Y')} ({cobertura_dias} dias)<br>"
+        f"Ordenação: {titulo_complemento} | Cor por {modo_cor}</b></span>"
+    )
+
+    altura_figura = max(600, len(lista_ordenada) * 24)
+
+    num_itens_legenda = len(legenda_adicionada)
+    altura_legenda_px = 45 + (num_itens_legenda * 24)
+    fracao_legenda = altura_legenda_px / altura_figura
+    y_dropdown = max(0.0, 1.0 - fracao_legenda - (20 / altura_figura))
+
+    fig.update_layout(
+        title=dict(
+            text=texto_titulo,
+            x=0.0,
+            y=0.985,
+            xanchor="left",
+            yanchor="top"
+        ),
+        updatemenus=[
+            dict(
+                type="dropdown",
+                direction="down",
+                x=1.025,
+                y=y_dropdown,
+                xanchor="left",
+                yanchor="top",
+                buttons=botoes_filtro,
+                bgcolor="#ffffff",
+                bordercolor="#cccccc",
+                font=dict(size=11),
+            )
+        ],
+        xaxis=dict(
+            title="Data",
+            type="date",
+            tickformat="%m/%Y",
+        ),
+        yaxis=dict(
+            title="",
+            showticklabels=False,
+            range=[len(lista_ordenada) - 0.5, -0.5],
+        ),
+        annotations=anotacoes_rotulos,
+        height=altura_figura,
+        margin=dict(t=185, b=60, l=margin_l, r=180, pad=10),
+        barmode="overlay",
+        bargap=0.2,
+        showlegend=True,
+        legend=dict(
+            title_text="Legenda",
+            x=1.025,
+            y=1.0,
+            xanchor="left",
+            yanchor="top",
+            font=dict(size=10),
+            bgcolor="rgba(255,255,255,0.8)",
+            bordercolor="#cccccc",
+            borderwidth=1,
+        ),
+        hovermode="closest",
+    )
+    return fig
+
+
+def gera_htmls(eventos, caminho_agrupado, caminho_cronologico, timestamp_dt, modo_cor="categoria"):
+    if not HAS_PLOTLY or not eventos:
+        return
+
+    ordem_cats = list(CORES_CATEGORIAS.keys())
+    eventos_agrupados = sorted(
+        eventos,
+        key=lambda e: (ordem_cats.index(e["categoria"]) if e["categoria"] in ordem_cats else 999, e["data"])
+    )
+    fig_agrupada = construir_figura_plotly(eventos_agrupados, "Agrupada por Categoria", timestamp_dt, modo_cor=modo_cor)
+    fig_agrupada.write_html(caminho_agrupado, include_plotlyjs=True)
+    print(f"  [OK] {caminho_agrupado}")
+
+    eventos_cronologicos = sorted(eventos, key=lambda e: (e["data"], e["id"]))
+    fig_crono = construir_figura_plotly(eventos_cronologicos, "Estritamente Cronológica", timestamp_dt, modo_cor=modo_cor)
+    fig_crono.write_html(caminho_cronologico, include_plotlyjs=True)
+    print(f"  [OK] {caminho_cronologico}")
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--cor",
+        choices=["categoria", "criticidade"],
+        default="categoria",
+        help="Colore as barras por categoria ou criticidade",
+    )
+    args = parser.parse_args()
+
+    agora = datetime.now()
+    timestamp_str = agora.strftime("%y%m%d_%H%M%S")
+
+    png_out = os.path.join(ANALISE_DIR, f"historico_{timestamp_str}.png")
+    html_agrupado_out = os.path.join(ANALISE_DIR, f"historico_agrupado_{timestamp_str}.html")
+    html_cronologico_out = os.path.join(ANALISE_DIR, f"historico_cronologico_{timestamp_str}.html")
+
+    print("=" * 78)
+    print("  GERADOR DE GANTT HISTORICO")
+    print("=" * 78)
+    print(f"CSV entrada: {CSV_IN}")
+    print(f"Cor por:     {args.cor}")
+    print(f"Execução:    {timestamp_str}")
+    print("=" * 78)
+
+    eventos = carregar_eventos()
+    print(f"\nEventos carregados: {len(eventos)}")
+
+    if not eventos:
+        return
+
+    print("\nGerando PNG (matplotlib)...")
+    gera_png(eventos, png_out, agora, modo_cor=args.cor)
+
+    if HAS_PLOTLY:
+        print("\nGerando ficheiros HTML (plotly)...")
+        gera_htmls(eventos, html_agrupado_out, html_cronologico_out, agora, modo_cor=args.cor)
+
+    print("\n" + "=" * 78)
+    print("CONCLUIDO")
+    print("=" * 78)
+    print(f"\nPNG:             {png_out}")
+    if HAS_PLOTLY:
+        print(f"HTML Agrupado:   {html_agrupado_out}")
+        print(f"HTML Cronológico:{html_cronologico_out}")
+
+
+if __name__ == "__main__":
+    main()
